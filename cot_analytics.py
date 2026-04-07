@@ -37,11 +37,26 @@ import sys
 import csv
 import json
 from datetime import datetime, timedelta
+import argparse
+import socket
+
+# Force UTF-8 stdout/stderr on Windows so box-drawing characters don't crash on cp1252 consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from googleapiclient.errors import HttpError
+from socket import timeout as TimeoutError # Import specific TimeoutError
 
 try:
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
+    import google_auth_httplib2
+    import httplib2
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 except ImportError:
@@ -51,6 +66,24 @@ except ImportError:
     print("  pip install google-api-python-client")
     sys.exit(1)
 
+_ORIG_GETADDRINFO = None
+
+def _maybe_force_ipv4():
+    global _ORIG_GETADDRINFO
+    val = os.environ.get("COT_FORCE_IPV4", "").strip().lower()
+    if val not in {"1", "true", "yes", "on"}:
+        return
+    if _ORIG_GETADDRINFO is not None:
+        return
+    _ORIG_GETADDRINFO = socket.getaddrinfo
+
+    def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        infos = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+        ipv4 = [i for i in infos if i and i[0] == socket.AF_INET]
+        return ipv4 or infos
+
+    socket.getaddrinfo = _getaddrinfo_ipv4_only
+
 
 # ------------------------------------------------------------
 # CONFIGURATION
@@ -58,6 +91,7 @@ except ImportError:
 
 SCRIPTS_DIR     = r"C:\Users\kchor\Desktop\COTCode"
 OUTPUT_DIR      = r"C:\Users\kchor\Pictures\COTMovies"
+ANALYTICS_LOG_FILE = os.path.join(OUTPUT_DIR, "analytics_log.txt")
 
 CLIENT_SECRETS  = os.path.join(SCRIPTS_DIR, "client_secrets.json")
 TOKEN_FILE      = os.path.join(SCRIPTS_DIR, "token.json")
@@ -96,8 +130,6 @@ CSV_FIELDS = [
     "avg_view_duration_formatted",
     "subscribers_gained",
     "subscribers_lost",
-    "impressions",
-    "ctr",
     "top_country_1",
     "top_country_2",
     "top_country_3",
@@ -119,10 +151,10 @@ CSV_FIELDS = [
 def log(msg, also_print=True):
     """Write timestamped message to console and log file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_path = os.path.join(OUTPUT_DIR, "analytics_log.txt")
     line      = f"[{timestamp}] {msg}"
     if also_print:
         print(line)
-    log_path = os.path.join(OUTPUT_DIR, "analytics_log.txt")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -137,6 +169,7 @@ def authenticate():
     Uses shared token.json — covers Data API, Analytics API, Upload.
     First run opens browser. Subsequent runs load token silently.
     """
+    _maybe_force_ipv4()
     if not os.path.isfile(CLIENT_SECRETS):
         print(f"\n  ERROR: client_secrets.json not found at:")
         print(f"  {CLIENT_SECRETS}")
@@ -168,9 +201,10 @@ def authenticate():
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
 
-    # Build both API services
-    youtube   = build("youtube",         "v3",  credentials=creds)
-    analytics = build("youtubeAnalytics", "v2", credentials=creds)
+    http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=60))
+
+    youtube   = build("youtube",         "v3",  http=http)
+    analytics = build("youtubeAnalytics", "v2", http=http)
 
     return youtube, analytics
 
@@ -204,14 +238,35 @@ def load_upload_log():
 
 def get_channel_id(youtube):
     """Get the authenticated user's channel ID."""
-    response = youtube.channels().list(
-        part="id,snippet",
-        mine=True
-    ).execute()
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            response = youtube.channels().list(
+                part="id,snippet",
+                mine=True
+            ).execute()
+            last_err = None
+            break
+        except (TimeoutError, OSError) as e:
+            last_err = e
+            log(f"  ERROR: Connection timed out while fetching channel ID (attempt {attempt}/3): {e}")
+            if attempt < 3:
+                try:
+                    import time
+                    time.sleep(2.0 * attempt)
+                except Exception:
+                    pass
+                continue
+        except HttpError as e:
+            log(f"  ERROR: HTTP error while fetching channel ID: {e}")
+            sys.exit(1)
+
+    if last_err is not None:
+        sys.exit(1)
 
     items = response.get("items", [])
     if not items:
-        print("  ERROR: No channel found for this account.")
+        log("  ERROR: No channel found for this account.")
         sys.exit(1)
 
     channel_id   = items[0]["id"]
@@ -297,27 +352,28 @@ def pull_video_metrics(analytics, youtube_id, start_date, end_date):
                 "averageViewDuration",
                 "subscribersGained",
                 "subscribersLost",
-                "impressions",
-                "impressionsClickThroughRate",
             ]),
             filters=f"video=={youtube_id}",
             dimensions="video",
         ).execute()
 
+        log(f"  DEBUG: API response for {youtube_id}: {response}", also_print=False)
         rows = response.get("rows", [])
         if not rows:
+            log(f"  DEBUG: No rows found for {youtube_id} in API response.", also_print=False)
             return {}
 
         row = rows[0]
-        return {
+        log(f"  DEBUG: Extracted row for {youtube_id}: {row}", also_print=False)
+        metrics_dict = {
             "views":                    int(row[1]),
             "watch_time_minutes":       round(float(row[2]), 1),
             "avg_view_duration_seconds": int(row[3]),
             "subscribers_gained":       int(row[4]),
             "subscribers_lost":         int(row[5]),
-            "impressions":              int(row[6]),
-            "ctr":                      round(float(row[7]) * 100, 2),  # as percentage
         }
+        log(f"  DEBUG: Processed metrics for {youtube_id}: {metrics_dict}", also_print=False)
+        return metrics_dict
 
     except HttpError as e:
         log(f"  WARNING: Could not pull metrics for {youtube_id}: {e}", also_print=False)
@@ -438,6 +494,30 @@ def save_analytics_csv(rows):
     return sorted_rows
 
 
+def load_analytics_csv():
+    """
+    Load analytics data from analytics.csv and convert numerical fields.
+    Returns list of dicts.
+    """
+    if not os.path.isfile(ANALYTICS_CSV):
+        return []
+
+    rows = []
+    with open(ANALYTICS_CSV, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Convert numeric fields back to numbers
+            for key in ["views", "avg_view_duration_seconds", "subscribers_gained", "subscribers_lost"]:
+                row[key] = int(row.get(key, 0))
+            for key in [
+                "watch_time_minutes", "traffic_search", "traffic_suggested",
+                "traffic_external", "traffic_direct", "traffic_other",
+            ]:
+                row[key] = float(row.get(key, 0.0))
+            rows.append(row)
+    return rows
+
+
 # ------------------------------------------------------------
 # LEADERBOARD
 # ------------------------------------------------------------
@@ -530,8 +610,6 @@ def run_analytics():
             "avg_view_duration_formatted": format_duration(avg_dur_sec),
             "subscribers_gained":         metrics.get("subscribers_gained", 0),
             "subscribers_lost":           metrics.get("subscribers_lost", 0),
-            "impressions":                metrics.get("impressions", 0),
-            "ctr":                        metrics.get("ctr", 0),
             "top_country_1":              countries[0],
             "top_country_2":              countries[1],
             "top_country_3":              countries[2],
@@ -570,17 +648,32 @@ def main():
     print(f"  Analytics CSV: {ANALYTICS_CSV}")
     print()
 
-    print("  SELECT ACTION")
-    print("  A. Pull analytics for all channel videos")
-    print("  L. Show leaderboard from existing analytics.csv")
-    print("  Q. Quit")
-    print()
+    parser = argparse.ArgumentParser(description="CatsofTravels — YouTube Analytics")
+    parser.add_argument(
+        "--action",
+        choices=["A", "L", "Q"],
+        help="A=pull analytics, L=leaderboard only, Q=quit. If omitted, prompts when interactive.",
+    )
+    args = parser.parse_args()
 
-    while True:
-        choice = input("  Choice: ").strip().upper()
-        if choice in ("A", "L", "Q"):
-            break
-        print("  Invalid choice.")
+    choice = (args.action or "").strip().upper() if args.action else ""
+
+    if not choice:
+        print("  SELECT ACTION")
+        print("  A. Pull analytics for all channel videos")
+        print("  L. Show leaderboard from existing analytics.csv")
+        print("  Q. Quit")
+        print()
+
+        if not sys.stdin or not sys.stdin.isatty():
+            log("  ERROR: No interactive console available. Re-run with --action A or --action L.")
+            return
+
+        while True:
+            choice = input("  Choice: ").strip().upper()
+            if choice in ("A", "L", "Q"):
+                break
+            print("  Invalid choice.")
 
     if choice == "Q":
         print("  Goodbye.")
@@ -589,15 +682,13 @@ def main():
     elif choice == "L":
         # Load and display existing analytics without re-pulling
         if not os.path.isfile(ANALYTICS_CSV):
-            print(f"\n  No analytics.csv found. Run option A first.")
+            log(f"  ERROR: Analytics CSV not found at {ANALYTICS_CSV}")
             return
-        rows = []
-        with open(ANALYTICS_CSV, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                row["views"] = int(row.get("views", 0))
-                rows.append(row)
-        sorted_rows = sorted(rows, key=lambda r: r["views"], reverse=True)
+        log("  Loading analytics from CSV...")
+        sorted_rows = load_analytics_csv()
+        if not sorted_rows:
+            log("  No data found in analytics.csv.")
+            return
         print_leaderboard(sorted_rows)
 
     elif choice == "A":

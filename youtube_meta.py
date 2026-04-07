@@ -61,6 +61,17 @@ import requests
 import json
 import tkinter as tk
 from tkinter import filedialog
+from googleapiclient.errors import HttpError
+import argparse
+
+# Force UTF-8 stdout on Windows
+import sys as _sys_utf8
+if _sys_utf8.platform == "win32" and hasattr(_sys_utf8.stdout, "reconfigure"):
+    try:
+        _sys_utf8.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
 
 # Inline editing with pre-populated fields
 try:
@@ -103,10 +114,19 @@ def SCRIPTS_DIR():     return _c("SCRIPTS_DIR", os.path.dirname(os.path.abspath(
 
 # LLM
 def LMSTUDIO_URL():    return _c("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-def LLM_MODE():        return _c("LLM_MODE", "lmstudio_local")
+def LLM_MODE():        return _c("LLM_MODE", "manual_only")
 def LLM_AVAILABLE():   return LLM_MODE() == "lmstudio_local"
 
-MODEL_NAME = _c("MODEL_NAME", "")
+# Session-level model override
+_MODEL_NAME_OVERRIDE = ""
+
+def MODEL_NAME():
+    return _MODEL_NAME_OVERRIDE or _c("MODEL_NAME", "")
+
+def _set_model(name):
+    global _MODEL_NAME_OVERRIDE
+    _MODEL_NAME_OVERRIDE = name
+
 
 # Confirmed flag — avoids re-prompting per folder in a session
 _LLM_CONFIRMED = False
@@ -131,6 +151,12 @@ def YT_AUDIO_LANGUAGE():   return _c("YT_AUDIO_LANGUAGE", "en")
 def FIXED_TAGS():
     if _cfg: return _cfg.get_fixed_tags()
     return ["CatsofTravels", "travel", "travelvlog"]
+
+def CHANNEL_NAME():
+    return _c("CHANNEL_NAME", "")
+
+def LLM_VOICE_STYLE():
+    return _c("LLM_VOICE_STYLE", "")
 
 # CSV columns — YouTube Data API ready
 CSV_FIELDS = [
@@ -204,7 +230,7 @@ def get_subfolders(root):
     EXCLUDE_NAMES = {"exclude", "_temp_frames", "COTMovies"}
     try:
         items = os.listdir(root)
-    except Exception:
+    except OSError:
         return []
 
     folders = [
@@ -256,10 +282,24 @@ def get_thumbnail_path(folder_path):
     Priority: thumbnail.jpg > final.jpg > blank
     Returns full path or empty string.
     """
-    for name in ("thumbnail.jpg", "final.jpg"):
-        candidate = os.path.join(folder_path, name)
-        if os.path.isfile(candidate):
-            return candidate
+    def _find_first(name: str) -> str:
+        try:
+            for root_dir, dirnames, filenames in os.walk(folder_path):
+                dirnames[:] = [d for d in dirnames if d.lower() != "exclude" and not d.startswith(".")]
+                for f in filenames:
+                    if f.lower() == name:
+                        p = os.path.join(root_dir, f)
+                        return p if os.path.isfile(p) else ""
+        except Exception:
+            return ""
+        return ""
+
+    p = _find_first("thumbnail.jpg")
+    if p:
+        return p
+    p = _find_first("final.jpg")
+    if p:
+        return p
     return ""
 
 
@@ -406,7 +446,7 @@ def llm_alive():
     """
     try:
         payload = {
-            "model": MODEL_NAME,
+            "model": MODEL_NAME(),
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": MAX_TOKENS_HEARTBEAT
         }
@@ -415,7 +455,8 @@ def llm_alive():
         return r.status_code == 200 and "choices" in data
     except requests.exceptions.ConnectionError:
         return False
-    except Exception:
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        print(f"  ERROR: LLM heartbeat failed due to request or JSON error: {e}")
         return False
 
 
@@ -430,23 +471,24 @@ def get_available_models():
         if r.status_code == 200:
             data = r.json()
             return [m["id"] for m in data.get("data", [])]
-    except Exception:
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        print(f"  ERROR: Could not fetch available models: {e}")
         pass
     return []
 
 
-def check_and_confirm_model():
+def check_and_confirm_model(interactive=True):
     """
     Startup check for LM Studio:
       1. Ping the server — if down, print actionable error and return False
       2. Query /v1/models — list what is loaded
-      3. If MODEL_NAME matches one loaded, confirm and continue
-      4. If MODEL_NAME doesn't match, show list and let user pick or keep
+      3. If MODEL_NAME matches one loaded, confirm and continue (interactive mode)
+      4. If MODEL_NAME doesn't match, show list and let user pick or keep (interactive mode)
     Returns True if ready to proceed, False to abort.
     """
-    global MODEL_NAME
+    # MODEL_NAME is now a function
 
-    print(f"\n  Checking LM Studio at {LMSTUDIO_URL} ...")
+    print(f"\n  Checking LM Studio at {LMSTUDIO_URL()} ...")
 
     models = get_available_models()
     if not models:
@@ -454,52 +496,71 @@ def check_and_confirm_model():
         print("  Please check:")
         print(f"    1. LM Studio is OPEN and the Local Server tab is active")
         print(f"    2. Server is STARTED (green indicator, port 1234)")
-        print(f"    3. URL in script matches: {LMSTUDIO_URL}")
+        print(f"    3. URL in script matches: {LMSTUDIO_URL()}")
         print(f"    4. A model is LOADED in LM Studio")
         return False
 
     print(f"  LM Studio reachable. Models available: {len(models)}")
     for i, m in enumerate(models, 1):
-        marker = "  <-- current config" if m == MODEL_NAME else ""
+        marker = "  <-- current config" if m == MODEL_NAME() else ""
         print(f"    {i}. {m}{marker}")
 
-    if MODEL_NAME in models:
-        print(f"\n  Using model: {MODEL_NAME}")
-        ans = input("  Press Enter to continue, or type a number to switch model: ").strip()
-        if ans.isdigit():
-            idx = int(ans) - 1
-            if 0 <= idx < len(models):
-                MODEL_NAME = models[idx]
-                print(f"  Switched to: {MODEL_NAME}")
-            else:
-                print("  Invalid number — keeping current model.")
-    else:
-        print(f"\n  WARNING: Configured model '{MODEL_NAME}' not found in loaded models.")
-        print("  Please select one of the available models:")
-        while True:
-            ans = input("  Enter number (or Q to abort): ").strip()
-            if ans.upper() == "Q":
-                return False
+    if MODEL_NAME() in models:
+        print(f"\n  Using model: {MODEL_NAME()}")
+        if interactive:
+            try:
+                ans = input("  Press Enter to continue, or type a number to switch model: ").strip()
+            except EOFError:
+                ans = ""
             if ans.isdigit():
                 idx = int(ans) - 1
                 if 0 <= idx < len(models):
-                    MODEL_NAME = models[idx]
-                    print(f"  Using model: {MODEL_NAME}")
-                    break
+                    _set_model(models[idx])
+                    print(f"  Switched to: {MODEL_NAME()}")
                 else:
-                    print("  Invalid number.")
+                    print("  Invalid number — keeping current model.")
+        else:
+            print("  Non-interactive mode: using current model.")
+    else:
+        if interactive:
+            print(f"\n  WARNING: Configured model '{MODEL_NAME()}' not found in loaded models.")
+            print("  Please select one of the available models:")
+            while True:
+                try:
+                    ans = input("  Enter number (or Q to abort): ").strip()
+                except EOFError:
+                    ans = "Q"
+                if ans.upper() == "Q":
+                    return False
+                if ans.isdigit():
+                    idx = int(ans) - 1
+                    if 0 <= idx < len(models):
+                        _set_model(models[idx])
+                        print(f"  Using model: {MODEL_NAME()}")
+                        break
+                    else:
+                        print("  Invalid number.")
+                else:
+                    print("  Please enter a number.")
+        else:
+            # Non-interactive mode: try to use first available model
+            print(f"\n  WARNING: Configured model '{MODEL_NAME()}' not found.")
+            if models:
+                _set_model(models[0])
+                print(f"  Auto-switched to: {MODEL_NAME()}")
             else:
-                print("  Please enter a number.")
+                print("  No models available.")
+                return False
 
     # Final ping with selected model
     if not llm_alive():
-        print(f"\n  ERROR: Model '{MODEL_NAME}' did not respond to test ping.")
+        print(f"\n  ERROR: Model '{MODEL_NAME()}' did not respond to test ping.")
         print("  Try loading the model manually in LM Studio, then retry.")
         return False
 
     global _LLM_CONFIRMED
     _LLM_CONFIRMED = True
-    print(f"  Model ready: {MODEL_NAME}\n")
+    print(f"  Model ready: {MODEL_NAME()}\n")
     return True
 
 
@@ -513,7 +574,7 @@ def call_llm(prompt, max_tokens):
     Handles multiple response formats for compatibility across models.
     """
     payload = {
-        "model": MODEL_NAME,
+        "model": MODEL_NAME(),
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.9,
         "max_tokens": max_tokens
@@ -645,7 +706,7 @@ Specific always beats general.
   bells, Forbidden City, Great Wall, Temple of Heaven, Tiananmen Square, markets
 - Tanzania/Serengeti: wildebeest, zebra, giraffe, lion, ugali, Maasai, acacia trees
 - Nepal/Kathmandu: dal bhat, momos, prayer flags, temples, yaks, the Himalayas,
-  sherpas, rhododendrons
+  sherpas, rhodendrons
 - Costa Rica: gallo pinto, casado, coffee, rainforest, sloths, toucans, Pura Vida
 - Mongolia: airag (fermented mare's milk), ger, nomads, the steppe, horses, eagles
 - Rome: supplì, carbonara, gelato, the Forum, the Colosseum, espresso, cats of Rome
@@ -674,9 +735,41 @@ These are examples, not templates — vary them, invent new ones:
 - "Have another look at [location] through the Cats' eyes."  (part 2+ only)
 - "See if you like this trip as much as the Cats did."
 - "If you like what you hear, [location] is worth the trip."
-- "Follow CatsofTravels for more."
+- "Follow the channel for more."
 - Or invent something that fits — the Cats never ends the same way twice.
 """
+
+
+def _voice_block():
+    try:
+        import cot_config as _cfg_local
+        _cfg_local.load(gui_mode=True)
+        v = (_cfg_local.get("LLM_VOICE_STYLE", "") or "").strip()
+        return v if v else TWAIN_VOICE
+    except Exception:
+        return TWAIN_VOICE
+
+
+def _examples_block():
+    try:
+        import cot_config as _cfg_local
+        _cfg_local.load(gui_mode=True)
+        ex = (_cfg_local.get("LLM_EXAMPLES_BLOCK", "") or "").strip()
+        return ex if ex else FEWSHOT_EXAMPLES
+    except Exception:
+        return FEWSHOT_EXAMPLES
+
+
+def _channel_line():
+    try:
+        import cot_config as _cfg_local
+        _cfg_local.load(gui_mode=True)
+        name = (_cfg_local.get("CHANNEL_NAME", "") or "").strip()
+        if name:
+            return f"You are writing YouTube metadata for the channel {name}."
+    except Exception:
+        pass
+    return "You are writing YouTube metadata for a YouTube channel."
 
 FEWSHOT_EXAMPLES = """
 === REAL EXAMPLES — MATCH THIS VOICE EXACTLY ===
@@ -771,11 +864,11 @@ def build_title_desc_prompt(location, folder_name, seed_notes=""):
     seed_block  = build_seed_block(seed_notes)
 
     return f"""
-You are writing YouTube metadata for the travel channel CatsofTravels.
+{_channel_line()}
 
-{TWAIN_VOICE}
+{_voice_block()}
 
-{FEWSHOT_EXAMPLES}
+{_examples_block()}
 
 {seed_block}
 
@@ -783,7 +876,7 @@ You are writing YouTube metadata for the travel channel CatsofTravels.
 {year_hint}
 Location: {location}
 
-Write a title and description for a CatsofTravels video about this location.
+Write a title and description for a video about this location.
 Seeds above are anchors — the real story. Landmarks are backdrop.
 Use your knowledge of {location} to fill gaps.
 No passive voice. Strong verbs. Twain voice throughout.
@@ -802,9 +895,9 @@ def build_regen_title_prompt(location, description, seed_notes=""):
     """Regenerate title only — Twain voice, seeds as anchors."""
     seed_block = build_seed_block(seed_notes)
     return f"""
-You are writing a YouTube title for the travel channel CatsofTravels.
+{_channel_line()}
 
-{TWAIN_VOICE}
+{_voice_block()}
 
 {seed_block}
 
@@ -834,9 +927,9 @@ def build_regen_desc_prompt(location, title, seed_notes=""):
     """Regenerate description only — Twain voice, seeds as anchors."""
     seed_block = build_seed_block(seed_notes)
     return f"""
-You are writing a YouTube description for the travel channel CatsofTravels.
+{_channel_line()}
 
-{TWAIN_VOICE}
+{_voice_block()}
 
 {seed_block}
 
@@ -867,7 +960,7 @@ DESCRIPTION:
 def build_tags_prompt(location, title, description):
     """Tags prompt — location-aware, specific, no fluff."""
     return f"""
-You are a YouTube SEO expert for the travel channel CatsofTravels.
+You are a YouTube SEO expert.
 
 Generate a comma-separated list of YouTube tags for the video below.
 
@@ -950,7 +1043,29 @@ def parse_tags(text):
         if fixed.lower() not in existing_lower:
             raw_tags.append(fixed)
 
-    return ", ".join(raw_tags)
+    return " ".join(raw_tags)
+
+
+def _template_metadata(location: str, folder_name: str):
+    loc = (location or "").strip()
+    if not loc:
+        loc = folder_name.strip()
+    title = f"Cats of Travels in {loc}" if loc else "Cats of Travels"
+    description = (
+        f"Join Cats of Travels in {loc}.\n"
+        "\n"
+        "Subscribe for more travel videos."
+    ) if loc else "Subscribe for more travel videos."
+    tags_list = [
+        "cats of travels",
+        "travel",
+        "travel vlog",
+        "cats",
+    ]
+    if loc:
+        tags_list.insert(1, loc)
+    tags = ", ".join(tags_list)
+    return title, description, tags
 
 
 # ------------------------------------------------------------
@@ -1001,7 +1116,7 @@ def load_seeds(folder_name):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f).get(folder_name, "")
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
         return ""
 
 
@@ -1017,13 +1132,13 @@ def save_seeds(folder_name, notes):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
+        except (FileNotFoundError, json.JSONDecodeError, IOError):
             pass
     data[folder_name] = notes
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    except Exception as e:
+    except (IOError, OSError) as e:
         print(f"  WARNING: Could not save seeds: {e}")
 
 
@@ -1054,8 +1169,72 @@ def backup_csv():
         backup = path + ".bak"
         try:
             shutil.copy2(path, backup)
-        except Exception:
+        except (IOError, OSError):
             pass  # backup failure should never block the write
+
+
+def refresh_thumbnails(root: str, offer_next_step: bool = True):
+    """Refresh the CSV 'thumbnail' column by rescanning folders.
+
+    For each row in the existing CSV, compute thumbnail path from the folder on disk:
+    thumbnail.jpg (preferred) > final.jpg > blank.
+    Updates only the 'thumbnail' field, preserving all other columns.
+    """
+
+    csv_path = CSV_PATH()
+    if not csv_path or not os.path.isfile(csv_path):
+        print("\n  No CSV found — nothing to refresh.")
+        return
+
+    if not root or not os.path.isdir(root):
+        raise FileNotFoundError(f"Root folder not found: {root}")
+
+    backup_csv()
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if not rows:
+        print("\n  CSV is empty — nothing to refresh.")
+        return
+
+    if "thumbnail" not in fieldnames:
+        print("\n  CSV has no 'thumbnail' column — nothing to refresh.")
+        return
+
+    updated = 0
+    missing = 0
+
+    for row in rows:
+        folder_name = (row.get("folder_name") or "").strip()
+        if not folder_name:
+            continue
+
+        folder_path = os.path.join(root, folder_name)
+        if not os.path.isdir(folder_path):
+            missing += 1
+            continue
+
+        new_thumb = get_thumbnail_path(folder_path)
+        old_thumb = (row.get("thumbnail") or "").strip()
+        if new_thumb != old_thumb:
+            row["thumbnail"] = new_thumb
+            updated += 1
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    print(f"\n  Thumbnail refresh complete. {updated} updated.")
+    if missing:
+        print(f"  WARNING: {missing} folder(s) from CSV not found under root.")
+
+    if offer_next_step:
+        _offer_next_step()
 
 
 def append_to_csv(folder_name, folder_path, location, title, description, tags):
@@ -1132,25 +1311,39 @@ def generate_metadata_for_folder(folder_path, batch_mode=False):
         return None, None, None
 
     # ── LLM check — only run once per session, skip if already confirmed ─
-    if not _LLM_CONFIRMED:
-        if not check_and_confirm_model():
+    if LLM_AVAILABLE() and not _LLM_CONFIRMED:
+        if not check_and_confirm_model(interactive=(not batch_mode)):
+            if batch_mode:
+                title, description, tags = _template_metadata(location, folder_name)
+                append_to_csv(folder_name, folder_path, location, title, description, tags)
+                print(f"  [AUTO] Saved (template): {title}")
+                return title, description, tags
             return None, None, None
 
     # ── Batch mode — generate and auto-accept ─────────────────
     if batch_mode:
-        title, description = generate_title_desc(location, folder_name)
-        time.sleep(CALL_DELAY_SECONDS)
-        tags = generate_tags(location, title, description)
-        append_to_csv(folder_name, folder_path, location, title, description, tags)
-        print(f"  [AUTO] Saved: {title}")
-        return title, description, tags
+        if LLM_AVAILABLE():
+            title, description = generate_title_desc(location, folder_name)
+            time.sleep(CALL_DELAY_SECONDS)
+            tags = generate_tags(location, title, description)
+            append_to_csv(folder_name, folder_path, location, title, description, tags)
+            print(f"  [AUTO] Saved: {title}")
+            return title, description, tags
+        else:
+            title, description, tags = _template_metadata(location, folder_name)
+            append_to_csv(folder_name, folder_path, location, title, description, tags)
+            print(f"  [AUTO] Saved (template): {title}")
+            return title, description, tags
 
     # ── Interactive mode ──────────────────────────────────────
     seed_notes = get_seed_notes()
 
-    title, description = generate_title_desc(location, folder_name, seed_notes)
-    time.sleep(CALL_DELAY_SECONDS)
-    tags = generate_tags(location, title, description)
+    if LLM_AVAILABLE():
+        title, description = generate_title_desc(location, folder_name, seed_notes)
+        time.sleep(CALL_DELAY_SECONDS)
+        tags = generate_tags(location, title, description)
+    else:
+        title, description, tags = "", "", ""
 
     while True:
         print(f"\n{'─'*60}")
@@ -1165,11 +1358,13 @@ def generate_metadata_for_folder(folder_path, batch_mode=False):
         print(f"  {tags}")
         print(f"{'─'*60}\n")
         print("  [A] Accept and save")
-        print("  [T] Regenerate title")
-        print("  [D] Regenerate description")
-        print("  [B] Regenerate both")
+        if LLM_AVAILABLE():
+            print("  [T] Regenerate title")
+            print("  [D] Regenerate description")
+            print("  [B] Regenerate both")
         print("  [E] Edit in place  (title -> description -> tags, Enter to keep each)")
-        print("  [S] Edit seed notes and regenerate both")
+        if LLM_AVAILABLE():
+            print("  [S] Edit seed notes and regenerate both")
         print("  [X] Skip this folder")
         print("  [Q] Quit")
         print()
@@ -1181,21 +1376,21 @@ def generate_metadata_for_folder(folder_path, batch_mode=False):
             print(f"\n  Saved to CSV: {CSV_PATH}\n")
             return title, description, tags
 
-        elif action == "t":
+        elif action == "t" and LLM_AVAILABLE():
             print("\n  Regenerating title...")
             text = call_llm(build_regen_title_prompt(location, description, seed_notes), MAX_TOKENS_TITLE_DESC)
             new_title, _ = parse_title_desc(text)
             if new_title:
                 title = new_title
 
-        elif action == "d":
+        elif action == "d" and LLM_AVAILABLE():
             print("\n  Regenerating description...")
             text = call_llm(build_regen_desc_prompt(location, title, seed_notes), MAX_TOKENS_TITLE_DESC)
             _, new_desc = parse_title_desc(text)
             if new_desc:
                 description = new_desc
 
-        elif action == "b":
+        elif action == "b" and LLM_AVAILABLE():
             print("\n  Regenerating title and description...")
             title, description = generate_title_desc(location, folder_name, seed_notes)
             time.sleep(CALL_DELAY_SECONDS)
@@ -1208,7 +1403,7 @@ def generate_metadata_for_folder(folder_path, batch_mode=False):
             description = input_with_prefill("  Description : ", description)
             tags        = input_with_prefill("  Tags        : ", tags)
 
-        elif action == "s":
+        elif action == "s" and LLM_AVAILABLE():
             print("\n  Edit seed notes — blank line to finish.\n")
             seed_notes = get_seed_notes()
             print("  Regenerating with new seeds...")
@@ -1287,7 +1482,7 @@ def mode_selective(root):
     _offer_next_step()
 
 
-def mode_batch(root):
+def mode_batch(root, offer_next_step: bool = True):
     """
     Mode C: Batch — all folders, no seeds, auto-accept, no prompts.
     Skips folders already in CSV.
@@ -1319,6 +1514,9 @@ def mode_batch(root):
 
     print(f"\n  Batch complete. {done} saved, {skipped} skipped.")
 
+    if offer_next_step:
+        _offer_next_step()
+
 
 def _offer_next_step():
     """
@@ -1339,6 +1537,7 @@ def main_metadata_menu():
     print("  A. One by one (interactive, seeded)")
     print("  B. Selective  (browse, interactive)")
     print("  C. Batch      (all folders, unseeded, auto-accept)")
+    print("  T. Refresh thumbnails in CSV (scan folders, no metadata regen)")
     print("  R. Review & Edit live videos on YouTube")
     print("  Q. Back")
     print()
@@ -1351,7 +1550,7 @@ def main_metadata_menu():
         mode_review_live()
         return
 
-    root = input(f"\n  Root pictures folder [{PICTURES_DIR}]: ").strip()
+    root = input(f"\n  Root pictures folder [{PICTURES_DIR()}]: ").strip()
     if not root:
         root = PICTURES_DIR()
     if not os.path.isdir(root):
@@ -1364,6 +1563,8 @@ def main_metadata_menu():
         mode_selective(root)
     elif choice == "C":
         mode_batch(root)
+    elif choice == "T":
+        refresh_thumbnails(root)
 
 
 # ------------------------------------------------------------
@@ -1389,34 +1590,59 @@ def mode_review_live():
         print("  and run: pip install google-api-python-client google-auth-oauthlib")
         return
 
+    try:
+        from cot_core import live_metadata as _live
+    except Exception:
+        _live = None
+
     print("\n  UC6 — VIEW & EDIT LIVE YOUTUBE METADATA")
 
     # Check LM Studio before auth — needed for T/D/B/S regeneration
     global _LLM_CONFIRMED
     if not _LLM_CONFIRMED:
-        if not check_and_confirm_model():
+        if not check_and_confirm_model(interactive=True):
             print("  LM Studio not available — regeneration (T/D/B/S) will be disabled.")
             print("  You can still browse and use E (edit in place) and P (change privacy).")
 
     print("  Authenticating with YouTube...")
 
     try:
-        youtube = yt_upload.authenticate()
+        if _live is not None:
+            youtube = _live.authenticate()
+        else:
+            youtube = yt_upload.authenticate()
     except SystemExit:
         return
-    except Exception as e:
-        print(f"\n  ERROR authenticating: {e}")
+    except HttpError as e:
+        print(f"\n  ERROR authenticating with YouTube: {e}")
         return
 
     print("  Authenticated.\n")
     print("  Fetching channel videos...")
 
-    try:
-        channel_id = _get_channel_id(youtube)
-        all_videos = _fetch_all_channel_videos(youtube, channel_id)
-    except Exception as e:
-        print(f"\n  ERROR fetching videos: {e}")
-        return
+    while True:
+        try:
+            if _live is not None:
+                channel_id = _live.get_channel_id(youtube)
+                all_videos = _live.fetch_all_channel_videos(youtube, channel_id)
+            else:
+                channel_id = _get_channel_id(youtube)
+                all_videos = _fetch_all_channel_videos(youtube, channel_id)
+            break
+        except HttpError as e:
+            print(f"\n  ERROR fetching videos from YouTube: {e}")
+            return
+        except (TimeoutError, OSError, RuntimeError) as e:
+            msg = str(e) or e.__class__.__name__
+            print("\n  ERROR: Network timeout while fetching channel videos.")
+            print(f"  Details: {msg}")
+            print("\n  Options:")
+            print("    R. Retry")
+            print("    Q. Quit")
+            c = input("  Choice [R]: ").strip().upper()
+            if c == "Q":
+                return
+            continue
 
     if not all_videos:
         print("  No videos found on channel.")
@@ -1468,7 +1694,7 @@ def mode_review_live():
 
         dry_run_label = "  *** DRY RUN ON ***" if dry_run else ""
         print(f"\n  Enter number to edit  |  /search  |  N=next  P=prev  Q=quit")
-        print(f"  B=bulk privacy  |  V=toggle dry run{dry_run_label}")
+        print(f"  B=bulk privacy  |  M=model select  |  V=toggle dry run{dry_run_label}  |  DEL=delete")
         if search_term:
             print(f"  C=clear filter")
         print()
@@ -1484,12 +1710,72 @@ def mode_review_live():
             state = "ON" if dry_run else "OFF"
             print(f"  Dry run mode: {state}")
 
+        elif cmd.upper() == "M":
+            _LLM_CONFIRMED = False
+            if not check_and_confirm_model(interactive=True):
+                print("  LM Studio not available — regeneration (T/D/B/S) will be disabled.")
+
         elif cmd.upper() == "B":
-            _bulk_privacy_change(youtube, yt_upload, all_videos, dry_run)
+            _bulk_privacy_change(youtube, yt_upload, all_videos, dry_run, _live)
             # Refresh after bulk change
             try:
-                all_videos = _fetch_all_channel_videos(youtube, channel_id)
-            except Exception:
+                if _live is not None:
+                    all_videos = _live.fetch_all_channel_videos(youtube, channel_id)
+                else:
+                    all_videos = _fetch_all_channel_videos(youtube, channel_id)
+            except HttpError:
+                pass
+
+        elif cmd.upper() == "DEL":
+            if dry_run:
+                print("\n  DRY RUN is ON — deletion is disabled.")
+                continue
+
+            print("\n  DELETE VIDEO")
+            print("  Enter the NUMBER of the video to delete (from the current filtered list).")
+            sel = input("  Number (or Enter to cancel): ").strip()
+            if not sel:
+                continue
+            if not sel.isdigit():
+                print("  Invalid number.")
+                continue
+            idx = int(sel) - 1
+            if not (0 <= idx < len(filtered)):
+                print("  Invalid number.")
+                continue
+
+            video = filtered[idx]
+            vid_id = video.get("youtube_id")
+            title = video.get("title", "") or ""
+            privacy = video.get("privacy", "")
+            print(f"\n  About to DELETE this video:")
+            print(f"  Title   : {title}")
+            print(f"  Privacy : {privacy}")
+            print(f"  URL     : https://youtu.be/{vid_id}")
+            print("\n  This cannot be undone. The video URL, views, comments, and analytics will be lost.")
+            confirm_title = input("  Type the EXACT title to confirm deletion: ").strip()
+            if confirm_title != title:
+                print("  Title did not match — cancelled.")
+                continue
+            confirm = input("  Final confirm — delete now? (y/N): ").strip().lower()
+            if confirm != "y":
+                print("  Cancelled.")
+                continue
+
+            try:
+                youtube.videos().delete(id=vid_id).execute()
+                print("  Deleted.")
+            except HttpError as e:
+                print(f"\n  ERROR deleting video: {e}")
+                continue
+
+            # Refresh after deletion
+            try:
+                if _live is not None:
+                    all_videos = _live.fetch_all_channel_videos(youtube, channel_id)
+                else:
+                    all_videos = _fetch_all_channel_videos(youtube, channel_id)
+            except HttpError:
                 pass
 
         elif cmd.upper() == "N":
@@ -1516,15 +1802,18 @@ def mode_review_live():
             idx = int(cmd) - 1
             if 0 <= idx < len(filtered):
                 video = filtered[idx]
-                _edit_live_video(youtube, video, yt_upload, dry_run=dry_run)
+                _edit_live_video(youtube, video, yt_upload, dry_run=dry_run, live_mod=_live)
                 # Refresh video list after edit
                 try:
-                    all_videos = _fetch_all_channel_videos(youtube, channel_id)
+                    if _live is not None:
+                        all_videos = _live.fetch_all_channel_videos(youtube, channel_id)
+                    else:
+                        all_videos = _fetch_all_channel_videos(youtube, channel_id)
                     filtered   = [
                         v for v in all_videos
                         if search_term.lower() in v["title"].lower()
                     ] if search_term else all_videos
-                except Exception:
+                except HttpError:
                     pass
             else:
                 print("  Invalid number.")
@@ -1532,7 +1821,7 @@ def mode_review_live():
             print("  Invalid input.")
 
 
-def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False):
+def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False, live_mod=None):
     """
     Bulk privacy change — set all or filtered videos to a new privacy status.
     Shows count by current privacy, confirms before proceeding.
@@ -1586,6 +1875,33 @@ def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False):
         print("  Cancelled.")
         return
 
+    if live_mod is not None:
+        def _progress(i, total, v, status):
+            title = (v.get("title", "") or "")[:45]
+            if status == "starting":
+                print(f"  [{i}/{total}] {title}...", end=" ")
+            elif status == "dry_run":
+                print("(dry run)")
+            elif status == "updated":
+                print("done")
+            elif status in ("failed", "error"):
+                print(status.upper())
+
+        results = live_mod.bulk_privacy_change(
+            youtube,
+            targets,
+            new_privacy=new_p,
+            filter_privacy=None,
+            dry_run=dry_run,
+            sleep_seconds=0.5,
+            progress_cb=_progress,
+        )
+        print(
+            f"\n  Bulk change complete: {results.get('updated', 0)} updated, "
+            f"{results.get('errors', 0)} errors.\n"
+        )
+        return
+
     done = 0
     errors = 0
     for i, v in enumerate(targets, 1):
@@ -1609,8 +1925,8 @@ def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False):
             else:
                 print("FAILED")
                 errors += 1
-        except Exception as e:
-            print(f"ERROR: {e}")
+        except HttpError as e:
+            print(f"ERROR pushing metadata: {e}")
             errors += 1
         import time as _bt; _bt.sleep(0.5)
 
@@ -1620,7 +1936,12 @@ def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False):
 def _get_channel_id(youtube):
     """Get authenticated user's channel ID."""
     from googleapiclient.errors import HttpError
-    response = youtube.channels().list(part="id", mine=True).execute()
+    from requests.exceptions import Timeout
+    try:
+        response = youtube.channels().list(part="id", mine=True).execute()
+    except Timeout:
+        print("  ERROR: Connection to YouTube API timed out while fetching channel ID.")
+        raise SystemExit(1)
     items    = response.get("items", [])
     if not items:
         raise Exception("No channel found for this account.")
@@ -1651,8 +1972,9 @@ def _fetch_all_channel_videos(youtube, channel_id):
             ch_resp["items"][0]["contentDetails"]
             ["relatedPlaylists"]["uploads"]
         )
-    except (HttpError, KeyError, IndexError) as e:
-        raise Exception(f"Could not get uploads playlist: {e}")
+    except (HttpError, KeyError, IndexError, Timeout) as e:
+        print(f"  ERROR: Connection to YouTube API timed out while fetching uploads playlist: {e}")
+        raise SystemExit(1)
 
     # Step 2 — collect all video IDs from playlist (includes private)
     video_ids  = []
@@ -1667,6 +1989,9 @@ def _fetch_all_channel_videos(youtube, channel_id):
             params["pageToken"] = page_token
         try:
             resp = youtube.playlistItems().list(**params).execute()
+        except Timeout as e:
+            print(f"  ERROR: Connection to YouTube API timed out while fetching playlist items: {e}")
+            raise SystemExit(1)
         except HttpError as e:
             raise Exception(f"Error fetching playlist items: {e}")
 
@@ -1720,7 +2045,7 @@ def _fetch_all_channel_videos(youtube, channel_id):
     return videos
 
 
-def _edit_live_video(youtube, video, yt_upload, dry_run=False):
+def _edit_live_video(youtube, video, yt_upload, dry_run=False, live_mod=None):
     """
     Interactive edit loop for a single live video.
     Fetches current metadata, shows T/D/B/E/S/A/X menu,
@@ -1730,7 +2055,10 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
     youtube_id = video["youtube_id"]
 
     print(f"\n  Fetching current metadata for: {video['title'][:55]}")
-    current = yt_upload.get_live_video_metadata(youtube, youtube_id)
+    if live_mod is not None:
+        current = live_mod.get_live_video_metadata(youtube, youtube_id)
+    else:
+        current = yt_upload.get_live_video_metadata(youtube, youtube_id)
 
     if not current:
         print("  ERROR: Could not fetch metadata. Skipping.")
@@ -1810,23 +2138,40 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
                 print("  No changes made.")
                 return
             print("\n  Pushing to YouTube...")
-            success = yt_upload.push_metadata_update(
-                youtube, youtube_id, title, description, tags,
-                privacy=current.get("privacy", "private"),
-                category=current.get("category", YT_CATEGORY()),
-                made_for_kids=current.get("made_for_kids", YT_KIDS()),
-                license=current.get("license", YT_LICENSE()),
-                embeddable=current.get("embeddable", YT_EMBEDDABLE()),
-                public_stats=current.get("public_stats", YT_PUBLIC_STATS()),
-                default_language=current.get("default_language", YT_DEFAULT_LANGUAGE()),
-                audio_language=current.get("audio_language", YT_AUDIO_LANGUAGE()),
-                paid_promo=current.get("paid_promo", YT_PAID_PROMO()),
-            )
+            if live_mod is not None:
+                success = live_mod.push_metadata_update(
+                    youtube, youtube_id, title, description, tags,
+                    privacy=current.get("privacy", "private"),
+                    category=current.get("category", YT_CATEGORY()),
+                    made_for_kids=current.get("made_for_kids", YT_KIDS()),
+                    license=current.get("license", YT_LICENSE()),
+                    embeddable=current.get("embeddable", YT_EMBEDDABLE()),
+                    public_stats=current.get("public_stats", YT_PUBLIC_STATS()),
+                    default_language=current.get("default_language", YT_DEFAULT_LANGUAGE()),
+                    audio_language=current.get("audio_language", YT_AUDIO_LANGUAGE()),
+                    paid_promo=current.get("paid_promo", YT_PAID_PROMO()),
+                )
+            else:
+                success = yt_upload.push_metadata_update(
+                    youtube, youtube_id, title, description, tags,
+                    privacy=current.get("privacy", "private"),
+                    category=current.get("category", YT_CATEGORY()),
+                    made_for_kids=current.get("made_for_kids", YT_KIDS()),
+                    license=current.get("license", YT_LICENSE()),
+                    embeddable=current.get("embeddable", YT_EMBEDDABLE()),
+                    public_stats=current.get("public_stats", YT_PUBLIC_STATS()),
+                    default_language=current.get("default_language", YT_DEFAULT_LANGUAGE()),
+                    audio_language=current.get("audio_language", YT_AUDIO_LANGUAGE()),
+                    paid_promo=current.get("paid_promo", YT_PAID_PROMO()),
+                )
             if success:
                 print(f"  Done — verifying...")
                 import time as _tv; _tv.sleep(2)
                 try:
-                    confirmed = yt_upload.get_live_video_metadata(youtube, youtube_id)
+                    if live_mod is not None:
+                        confirmed = live_mod.get_live_video_metadata(youtube, youtube_id)
+                    else:
+                        confirmed = yt_upload.get_live_video_metadata(youtube, youtube_id)
                     if confirmed:
                         print(f"  ✓ Title    : {confirmed.get('title','')[:60]}")
                         print(f"  ✓ Privacy  : {confirmed.get('privacy','')}")
@@ -1834,8 +2179,8 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
                         print(f"  ✓ https://youtu.be/{youtube_id}")
                     else:
                         print(f"  ⚠ Could not re-fetch to confirm — check YouTube Studio.")
-                except Exception:
-                    print(f"  ✓ Pushed — https://youtu.be/{youtube_id}")
+                except HttpError:
+                    print(f"  ⚠ Could not re-fetch to confirm — check YouTube Studio.")
             return
 
         elif action == "t":
@@ -1845,7 +2190,7 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
             print("\n  Regenerating title...")
             if not llm_alive():
                 print("  ERROR: LM Studio not responding.")
-                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME}' loaded.")
+                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME()}' loaded.")
                 continue
             text = call_llm(
                 build_regen_title_prompt(location, description, seed_notes),
@@ -1859,7 +2204,7 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
             print("\n  Regenerating description...")
             if not llm_alive():
                 print("  ERROR: LM Studio not responding.")
-                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME}' loaded.")
+                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME()}' loaded.")
                 continue
             text = call_llm(
                 build_regen_desc_prompt(location, title, seed_notes),
@@ -1873,7 +2218,7 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
             print("\n  Regenerating title and description...")
             if not llm_alive():
                 print("  ERROR: LM Studio not responding.")
-                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME}' loaded.")
+                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME()}' loaded.")
                 continue
             title, description = generate_title_desc(location, video["title"], seed_notes)
             import time as _time
@@ -1892,7 +2237,7 @@ def _edit_live_video(youtube, video, yt_upload, dry_run=False):
             print("\n  Regenerating with seeds...")
             if not llm_alive():
                 print("  ERROR: LM Studio not responding.")
-                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME}' loaded.")
+                print(f"  Check: server running at {LMSTUDIO_URL()}, model '{MODEL_NAME()}' loaded.")
                 continue
             title, description = generate_title_desc(location, video["title"], seed_notes)
             import time as _time
@@ -1988,15 +2333,31 @@ def main():
     print("  A. One by one  — interactive, seeded, full review")
     print("  B. Selective   — browse dialog, pick specific folders")
     print("  C. Batch       — all folders, unseeded, auto-accept")
+    print("  T. Refresh thumbnails in CSV (scan folders, no metadata regen)")
     print("  R. Review & Edit live YouTube videos")
     print("  Q. Quit")
     print()
 
-    while True:
-        choice = input("  Choice: ").strip().upper()
-        if choice in ("A", "B", "C", "R", "Q"):
-            break
-        print("  Invalid choice.")
+    parser = argparse.ArgumentParser(description="Generate YouTube metadata or review live videos.")
+    parser.add_argument("--mode", choices=["A", "B", "C", "T", "R"], help="Operation mode: A (One by one), B (Selective), C (Batch), T (Refresh thumbnails), R (Review & Edit live).")
+    args = parser.parse_args()
+
+    choice = args.mode
+    if not choice:
+        print("  SELECT MODE")
+        print("  A. One by one  — interactive, seeded, full review")
+        print("  B. Selective   — browse dialog, pick specific folders")
+        print("  C. Batch       — all folders, unseeded, auto-accept")
+        print("  T. Refresh thumbnails in CSV (scan folders, no metadata regen)")
+        print("  R. Review & Edit live YouTube videos")
+        print("  Q. Quit")
+        print()
+
+        while True:
+            choice = input("  Choice: ").strip().upper()
+            if choice in ("A", "B", "C", "T", "R", "Q"):
+                break
+            print("  Invalid choice.")
 
     if choice == "Q":
         print("  Goodbye.")
@@ -2007,7 +2368,7 @@ def main():
         print("\n  Done. Goodbye.")
         return
 
-    root = input(f"\n  Root pictures folder [{PICTURES_DIR}]: ").strip()
+    root = input(f"\n  Root pictures folder [{PICTURES_DIR()}]: ").strip()
     if not root:
         root = PICTURES_DIR()
     if not os.path.isdir(root):
@@ -2020,6 +2381,8 @@ def main():
         mode_selective(root)
     elif choice == "C":
         mode_batch(root)
+    elif choice == "T":
+        refresh_thumbnails(root)
 
     print("\n  Done. Goodbye.")
 

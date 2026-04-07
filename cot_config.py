@@ -30,11 +30,20 @@ import os
 import sys
 import json
 import subprocess
+from typing import Any
 
 # ── Location of config file ───────────────────────────────────
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH  = os.path.join(SCRIPTS_DIR, "cot_config.json")
 VERSION      = "1.0.0"
+
+# Force UTF-8 output so box-drawing chars work on Windows cp1252 terminals
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ── Loaded config dict ────────────────────────────────────────
 _config = {}
@@ -77,6 +86,7 @@ DEFAULTS = {
     "MODEL_NAME":         "",
 
     # YouTube channel defaults
+    "YT_CHANNEL_ID":      "",
     "YT_CATEGORY":        "19",
     "YT_COMMENTS":        "allow",
     "YT_KIDS":            False,
@@ -91,6 +101,14 @@ DEFAULTS = {
     # Pipeline
     "CHANNEL_NAME":       "CatsofTravels",
     "FIXED_TAGS":         ["CatsofTravels", "travel", "travelvlog"],
+
+    # LLM prompt defaults
+    "LLM_VOICE_STYLE":     "",
+    "LLM_EXAMPLES_BLOCK":  "",
+
+    "MAKE_SHOW_FINAL_HOLD_SEC":  2.0,
+    "MAKE_SHOW_FINAL_FADE_SEC":  2.0,
+    "MAKE_SHOW_AUDIO_FADE_SEC":  2.0,
 }
 
 
@@ -98,11 +116,11 @@ DEFAULTS = {
 # LOAD / SAVE
 # ------------------------------------------------------------
 
-def load():
+def load(gui_mode=False):
     """
     Load config from cot_config.json.
-    If not found, launch first-run wizard automatically.
-    Derives computed paths after loading.
+    If not found and gui_mode=False, launch first-run wizard automatically.
+    If gui_mode=True, skip wizard (GUI tools handle config via Settings).
     """
     global _config
     if os.path.isfile(CONFIG_PATH):
@@ -112,10 +130,17 @@ def load():
             _derive_paths()
             return True
         except Exception as e:
-            print(f"\n  WARNING: Could not read cot_config.json: {e}")
-            print("  Launching setup wizard...\n")
+            if not gui_mode:
+                print(f"\n  WARNING: Could not read cot_config.json: {e}")
+                print("  Launching setup wizard...\n")
 
-    # No config found — run wizard
+    if gui_mode:
+        # GUI mode: load defaults silently, do NOT run wizard
+        _config = dict(DEFAULTS)
+        _derive_paths()
+        return True
+
+    # CLI mode: run wizard
     run_wizard()
     return True
 
@@ -132,6 +157,14 @@ def save():
 def get(key, default=None):
     """Get a config value. Falls back to DEFAULTS then to default param."""
     return _config.get(key, DEFAULTS.get(key, default))
+
+
+def set(key: str, value: Any, *, save_now: bool = False) -> None:
+    """Set a config value in memory. Optionally save to disk immediately."""
+    _config[key] = value
+    _derive_paths()
+    if save_now:
+        save()
 
 
 def _derive_paths():
@@ -221,6 +254,9 @@ def run_wizard():
     print("\n  ── YOUTUBE CHANNEL DEFAULTS ────────────────────────")
     print("  These apply to every video — change per-video in UC6 if needed.\n")
 
+    val = input(f"  Channel ID override (optional) [{cfg.get('YT_CHANNEL_ID','')}]: ").strip()
+    if val: cfg["YT_CHANNEL_ID"] = val
+
     val = input(f"  Channel name [{cfg['CHANNEL_NAME']}]: ").strip()
     if val: cfg["CHANNEL_NAME"] = val
 
@@ -242,6 +278,19 @@ def run_wizard():
     val = input(f"  Fixed tags always added [{tags_str}]: ").strip()
     if val:
         cfg["FIXED_TAGS"] = [t.strip() for t in val.split(",") if t.strip()]
+
+    # ── LLM prompt customization ─────────────────────────────
+    print("\n  ── LLM PROMPT CUSTOMIZATION ────────────────────────")
+    print("  Optional: paste a custom voice/style block and examples.")
+    print("  Leave blank to use the built-in defaults.\n")
+
+    val = input("  Custom voice/style block (single line or short) [blank=default]: ").strip()
+    if val:
+        cfg["LLM_VOICE_STYLE"] = val
+
+    val = input("  Custom examples block (single line or short) [blank=default]: ").strip()
+    if val:
+        cfg["LLM_EXAMPLES_BLOCK"] = val
 
     # ── Save ──────────────────────────────────────────────────
     _config = cfg

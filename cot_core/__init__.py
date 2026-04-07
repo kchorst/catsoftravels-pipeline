@@ -1,0 +1,1 @@
+"""Shared, prompt-free core utilities for the CatsofTravels tool suite."""

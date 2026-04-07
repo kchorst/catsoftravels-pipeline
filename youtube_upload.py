@@ -57,20 +57,53 @@ import json
 import argparse
 import time
 from datetime import datetime
+import socket
+
+# Force UTF-8 stdout on Windows
+import sys as _sys_utf8
+if _sys_utf8.platform == "win32" and hasattr(_sys_utf8.stdout, "reconfigure"):
+    try:
+        _sys_utf8.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 try:
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
+    import google_auth_httplib2
+    import httplib2
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
     from googleapiclient.errors import HttpError
+    from requests.exceptions import Timeout
 except ImportError:
     print("ERROR: Google API libraries not installed.")
     print("Run:")
     print("  pip install google-auth google-auth-oauthlib google-auth-httplib2")
     print("  pip install google-api-python-client")
     sys.exit(1)
+
+
+_ORIG_GETADDRINFO = None
+
+
+def _maybe_force_ipv4():
+    global _ORIG_GETADDRINFO
+    val = os.environ.get("COT_FORCE_IPV4", "").strip().lower()
+    if val not in {"1", "true", "yes", "on"}:
+        return
+    if _ORIG_GETADDRINFO is not None:
+        return
+    _ORIG_GETADDRINFO = socket.getaddrinfo
+
+    def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        infos = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+        ipv4 = [i for i in infos if i and i[0] == socket.AF_INET]
+        return ipv4 or infos
+
+    socket.getaddrinfo = _getaddrinfo_ipv4_only
 
 
 # ------------------------------------------------------------
@@ -142,6 +175,7 @@ def load_upload_log():
     Load the upload log JSON.
     Returns dict: { folder_name: { youtube_id, uploaded_at, title } }
     """
+    log(f"  UPLOAD_LOG: {UPLOAD_LOG()}")
     if not os.path.isfile(UPLOAD_LOG()):
         return {}
     try:
@@ -179,6 +213,8 @@ def authenticate():
     - Subsequent runs: loads token.json, refreshes if expired
     Returns an authenticated YouTube API service object.
     """
+    _maybe_force_ipv4()
+    log(f"  CLIENT_SECRETS: {CLIENT_SECRETS()}")
     if not os.path.isfile(CLIENT_SECRETS()):
         print(f"\n  ERROR: client_secrets.json not found at:")
         print(f"  {CLIENT_SECRETS()}")
@@ -193,7 +229,8 @@ def authenticate():
     creds = None
 
     # Load existing token if available
-    if os.path.isfile(TOKEN_FILE):
+    log(f"  TOKEN_FILE: {TOKEN_FILE()}")
+    if os.path.isfile(TOKEN_FILE()):
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_FILE(), SCOPES)
         except Exception:
@@ -205,21 +242,33 @@ def authenticate():
             try:
                 creds.refresh(Request())
                 log("  Token refreshed successfully.")
-            except Exception:
+            except Timeout as e:
+                log(f"  ERROR: Connection to Google API timed out during token refresh: {e}")
+                sys.exit(1)
+            except Exception: # Catch other exceptions
                 creds = None
 
         if not creds:
             print("\n  Opening browser for Google authentication...")
             print("  Log in with the Google account linked to your YouTube channel.")
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS(), SCOPES)
-            creds = flow.run_local_server(port=0)
+            try:
+                creds = flow.run_local_server(port=0)
+            except Timeout as e:
+                log(f"  ERROR: Connection to Google API timed out during authentication flow: {e}")
+                sys.exit(1)
             print("  Authentication successful.\n")
 
         # Save token for future runs
         with open(TOKEN_FILE(), "w") as f:
             f.write(creds.to_json())
 
-    return build("youtube", "v3", credentials=creds)
+    try:
+        http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=60))
+        return build("youtube", "v3", http=http)
+    except Timeout as e:
+        log(f"  ERROR: Connection to YouTube API timed out while building service: {e}")
+        sys.exit(1)
 
 
 # ------------------------------------------------------------
@@ -231,6 +280,7 @@ def load_csv():
     Load youtube_uploads.csv and return list of row dicts.
     Returns empty list if file not found.
     """
+    log(f"  CSV_PATH: {CSV_PATH()}")
     if not os.path.isfile(CSV_PATH()):
         print(f"\n  ERROR: CSV not found: {CSV_PATH()}")
         print("  Run youtube_meta.py first to generate metadata.")
@@ -393,6 +443,9 @@ def upload_video(youtube, row, dry_run=False):
             if status:
                 pct = int(status.progress() * 100)
                 print(f"  Upload progress: {pct}%", end="\r")
+        except Timeout as e:
+            log(f"  ERROR: Connection to YouTube API timed out during video upload: {e}")
+            return None
         except HttpError as e:
             if e.resp.status in (500, 502, 503, 504):
                 # Transient server error — wait and retry
@@ -415,6 +468,9 @@ def upload_video(youtube, row, dry_run=False):
                 media_body=MediaFileUpload(thumbnail)
             ).execute()
             log("  Thumbnail set.")
+        except Timeout as e:
+            log(f"  WARNING: Connection to YouTube API timed out during thumbnail upload: {e}")
+            # Non-fatal — video still uploaded successfully
         except HttpError as e:
             log(f"  WARNING: Thumbnail upload failed: {e}")
             # Non-fatal — video still uploaded successfully

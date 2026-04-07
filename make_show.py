@@ -33,13 +33,33 @@ Requirements:
 
 import os
 import sys
+import time
+import math
+import subprocess
 import gc
 import shutil
-import subprocess
-import time
 import tkinter as tk
 from tkinter import filedialog
 from datetime import datetime
+
+try:
+    from cot_core.runtime import is_interactive as _is_interactive
+    from cot_core.runtime import safe_input as _safe_input
+except Exception:
+    def _is_interactive() -> bool:
+        try:
+            stdin = sys.stdin
+            return bool(stdin and hasattr(stdin, "isatty") and stdin.isatty())
+        except Exception:
+            return False
+
+    def _safe_input(prompt: str = "", default: str = "") -> str:
+        if not _is_interactive():
+            return default
+        try:
+            return input(prompt)
+        except EOFError:
+            return default
 
 try:
     from PIL import Image, ImageOps, ImageEnhance, ImageFilter
@@ -67,6 +87,30 @@ LOG_FILE        = os.path.join(OUTPUT_DIR, "log.txt")
 LOG_MAX_BYTES   = 1 * 1024 * 1024
 TEMP_DIR        = os.path.join(OUTPUT_DIR, "_temp_frames")
 EXCLUDE_NAME    = "exclude"
+
+_NO_WINDOW_FLAGS = {}
+if sys.platform == "win32":
+    try:
+        _NO_WINDOW_FLAGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+    except Exception:
+        _NO_WINDOW_FLAGS = {}
+
+
+def _find_single_file_anywhere(root_folder: str, filename: str):
+    target = filename.lower()
+    found = None
+    for root_dir, dirnames, filenames in os.walk(root_folder):
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".") and d.lower() != EXCLUDE_NAME
+        ]
+        for f in filenames:
+            if f.lower() == target:
+                path = os.path.join(root_dir, f)
+                if found is not None and os.path.normpath(found) != os.path.normpath(path):
+                    return None
+                found = path
+    return found
 
 # Video
 WIDTH           = 1920
@@ -295,66 +339,87 @@ def get_image_files(folder):
     Direct JPGs if present, else combines subfolders (skips 'exclude').
     Sorted by EXIF date, fallback filename.
     """
-    direct = get_jpg_files_in_folder(folder)
-    if direct:
-        direct.sort(key=lambda x: (get_image_date(x), os.path.basename(x).lower()))
-        return direct, [folder]
+    thumb_path = _find_single_file_anywhere(folder, "thumbnail.jpg")
+    final_path = _find_single_file_anywhere(folder, "final.jpg")
 
+    def _is_special(p: str) -> bool:
+        if not p:
+            return False
+        pn = os.path.normpath(p)
+        if thumb_path and os.path.normpath(thumb_path) == pn:
+            return True
+        if final_path and os.path.normpath(final_path) == pn:
+            return True
+        return False
+
+    def _collect_images_recursive(start_dir: str):
+        imgs = []
+        srcs = []
+        try:
+            for root_dir, dirnames, filenames in os.walk(start_dir):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not d.startswith(".") and d.lower() != EXCLUDE_NAME
+                ]
+                files = [
+                    os.path.join(root_dir, f)
+                    for f in filenames
+                    if os.path.splitext(f)[1].lower() in {".jpg", ".jpeg"}
+                ]
+                files = [p for p in files if os.path.isfile(p) and not _is_special(p)]
+                if files:
+                    if root_dir not in srcs:
+                        srcs.append(root_dir)
+                    imgs.extend(files)
+        except Exception as e:
+            log(f"  ERROR scanning folders: {e}")
+
+        imgs.sort(key=lambda x: (get_image_date(x), os.path.basename(x).lower()))
+        return imgs, srcs
+
+    top_level_imgs = [
+        p for p in get_jpg_files_in_folder(folder)
+        if not _is_special(p)
+    ]
+    top_level_imgs.sort(key=lambda x: (get_image_date(x), os.path.basename(x).lower()))
+
+    sub_imgs = []
     source_folders = []
-    all_files      = []
     try:
         subs = sorted(
             [e for e in os.scandir(folder)
-             if e.is_dir() and e.name.lower() != EXCLUDE_NAME],
+             if e.is_dir() and not e.name.startswith(".") and e.name.lower() != EXCLUDE_NAME],
             key=lambda e: e.name.lower()
         )
         for sub in subs:
-            files = get_jpg_files_in_folder(sub.path)
-            if files:
-                all_files.extend(files)
-                source_folders.append(sub.path)
+            imgs, srcs = _collect_images_recursive(sub.path)
+            if imgs:
+                sub_imgs.extend(imgs)
+                for s in srcs:
+                    if s not in source_folders:
+                        source_folders.append(s)
     except Exception as e:
         log(f"  ERROR scanning subfolders: {e}")
 
-    all_files.sort(key=lambda x: (get_image_date(x), os.path.basename(x).lower()))
+    all_files = []
+    if top_level_imgs:
+        all_files.extend(top_level_imgs)
+        if folder not in source_folders:
+            source_folders.insert(0, folder)
+    if sub_imgs:
+        all_files.extend(sub_imgs)
+
     return all_files, source_folders
 
 def find_final_jpg(folder, source_folders):
     """
     Find final.jpg. One=use, multiple=user picks, none=return None.
     """
-    candidates = []
-    top = os.path.join(folder, "final.jpg")
-    if os.path.isfile(top):
-        candidates.append(top)
-    for sf in source_folders:
-        if sf == folder:
-            continue
-        p = os.path.join(sf, "final.jpg")
-        if os.path.isfile(p) and p not in candidates:
-            candidates.append(p)
-
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        log(f"  final.jpg: {candidates[0]}")
-        return candidates[0]
-
-    print(f"\n  Multiple final.jpg found:")
-    for i, p in enumerate(candidates, 1):
-        print(f"  {i}. {p}")
-    print(f"  {len(candidates)+1}. Use last image by date")
-    while True:
-        try:
-            c = int(input("  Choice: ").strip())
-            if 1 <= c <= len(candidates):
-                log(f"  final.jpg: {candidates[c-1]}")
-                return candidates[c-1]
-            if c == len(candidates) + 1:
-                return None
-        except ValueError:
-            pass
-        print("  Invalid choice.")
+    path = _find_single_file_anywhere(folder, "final.jpg")
+    if path and os.path.isfile(path):
+        log(f"  final.jpg: {path}")
+        return path
+    return None
 
 def get_subfolders(root):
     try:
@@ -372,21 +437,15 @@ def get_subfolders(root):
 def count_images(folder):
     exts = {".jpg", ".jpeg"}
     try:
-        direct = sum(
-            1 for f in os.listdir(folder)
-            if os.path.splitext(f)[1].lower() in exts
-            and os.path.isfile(os.path.join(folder, f))
-        )
-        if direct > 0:
-            return direct
         total = 0
-        for entry in os.scandir(folder):
-            if entry.is_dir() and entry.name.lower() != EXCLUDE_NAME:
-                total += sum(
-                    1 for f in os.listdir(entry.path)
-                    if os.path.splitext(f)[1].lower() in exts
-                    and os.path.isfile(os.path.join(entry.path, f))
-                )
+        for root_dir, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith(".") and d.lower() != EXCLUDE_NAME
+            ]
+            for f in filenames:
+                if os.path.splitext(f)[1].lower() in exts:
+                    total += 1
         return total
     except Exception:
         return 0
@@ -499,7 +558,7 @@ def make_fade_frames(arr, num_frames):
 
 # ─── VIDEO BUILD ──────────────────────────────────────────────────────────────
 def build_video(folder, images, output_path, frames_per_image,
-                frames_hold, frames_fade):
+                frames_hold, frames_fade, *, stop_event=None, pause_event=None):
     """
     Pipe raw RGB frames into FFmpeg stdin.
     frames_hold/frames_fade from user settings.
@@ -549,13 +608,34 @@ def build_video(folder, images, output_path, frames_per_image,
             cmd,
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10 * 1024 * 1024
+            bufsize=10 * 1024 * 1024,
+            **_NO_WINDOW_FLAGS,
         )
 
         frames_written = 0
         skipped        = 0
 
         for img_num, filepath in enumerate(images):
+            if stop_event is not None and stop_event.is_set():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+                return False
+
+            while pause_event is not None and pause_event.is_set():
+                if stop_event is not None and stop_event.is_set():
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    return False
+                time.sleep(0.1)
+
             is_last = (img_num == total_images - 1)
 
             arr = prepare_frame(filepath)
@@ -566,15 +646,57 @@ def build_video(folder, images, output_path, frames_per_image,
             if is_last:
                 raw = arr.tobytes()
                 for _ in range(frames_hold):
+                    if stop_event is not None and stop_event.is_set():
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        return False
+                    while pause_event is not None and pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            try:
+                                process.terminate()
+                            except Exception:
+                                pass
+                            return False
+                        time.sleep(0.1)
                     process.stdin.write(raw)
                     frames_written += 1
                 del raw
                 for faded_bytes in make_fade_frames(arr, frames_fade):
+                    if stop_event is not None and stop_event.is_set():
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        return False
+                    while pause_event is not None and pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            try:
+                                process.terminate()
+                            except Exception:
+                                pass
+                            return False
+                        time.sleep(0.1)
                     process.stdin.write(faded_bytes)
                     frames_written += 1
             else:
                 raw = arr.tobytes()
                 for _ in range(frames_per_image):
+                    if stop_event is not None and stop_event.is_set():
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        return False
+                    while pause_event is not None and pause_event.is_set():
+                        if stop_event is not None and stop_event.is_set():
+                            try:
+                                process.terminate()
+                            except Exception:
+                                pass
+                            return False
+                        time.sleep(0.1)
                     process.stdin.write(raw)
                     frames_written += 1
                 del raw
@@ -685,7 +807,7 @@ def add_audio(video_path, audio_path, total_duration,
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, **_NO_WINDOW_FLAGS)
         if result.returncode != 0:
             log(f"  FFmpeg audio ERROR:\n{result.stderr[-2000:]}")
             return False
@@ -731,7 +853,7 @@ def handle_existing(output_path):
 
 # ─── CORE: PROCESS ONE FOLDER ─────────────────────────────────────────────────
 def process_folder(folder, frames_per_image, frames_hold, frames_fade,
-                   audio_fade_sec, auto_audio_path=None, silent=False):
+                   audio_fade_sec, auto_audio_path=None, silent=False, *, stop_event=None, pause_event=None):
     """
     Build video for one folder.
     auto_audio_path: if set, apply this audio automatically (batch mode)
@@ -764,9 +886,24 @@ def process_folder(folder, frames_per_image, frames_hold, frames_fade,
     if final_output is None:
         return None
 
-    result = build_video(folder, images, final_output,
-                         frames_per_image, frames_hold, frames_fade)
+    result = build_video(
+        folder,
+        images,
+        final_output,
+        frames_per_image,
+        frames_hold,
+        frames_fade,
+        stop_event=stop_event,
+        pause_event=pause_event,
+    )
     if not result:
+        if stop_event is not None and stop_event.is_set():
+            try:
+                if os.path.isfile(final_output):
+                    os.remove(final_output)
+                    log(f"  Deleted partial: {os.path.basename(final_output)}")
+            except Exception:
+                pass
         log("  Video build failed.")
         return None
 
@@ -887,17 +1024,32 @@ def mode_normal(subfolders, frames_per_image, frames_hold, frames_fade, audio_fa
 
 # ─── MODE B: BATCH SILENT ─────────────────────────────────────────────────────
 def mode_batch_silent(subfolders, frames_per_image, frames_hold,
-                      frames_fade, audio_fade_sec):
+                      frames_fade, audio_fade_sec, *, interactive=None, skip_done_default=True, stop_event=None, pause_event=None):
     """Process all folders silently, fully automatic."""
-    print("\n  Skip folders already marked [DONE]?")
-    skip_done = input("  Y/N [Y]: ").strip().upper()
-    skip_done = (skip_done != "N")
+    if interactive is None:
+        interactive = _is_interactive()
+    if interactive:
+        print("\n  Skip folders already marked [DONE]?")
+        skip_done = _safe_input("  Y/N [Y]: ", default="").strip().upper()
+        skip_done = (skip_done != "N")
+    else:
+        skip_done = bool(skip_done_default)
 
     total   = len(subfolders)
     done    = 0
     skipped = 0
 
     for folder in subfolders:
+        if stop_event is not None and stop_event.is_set():
+            log("  Stopped.")
+            break
+
+        while pause_event is not None and pause_event.is_set():
+            if stop_event is not None and stop_event.is_set():
+                log("  Stopped.")
+                break
+            time.sleep(0.1)
+
         folder_name = os.path.basename(folder)
         if skip_done and output_exists(folder_name):
             log(f"  Skipping [DONE]: {folder_name}")
@@ -908,15 +1060,23 @@ def mode_batch_silent(subfolders, frames_per_image, frames_hold,
             log(f"  No images: {folder_name}")
             skipped += 1
             continue
-        process_folder(folder, frames_per_image, frames_hold,
-                       frames_fade, audio_fade_sec, silent=True)
+        process_folder(
+            folder,
+            frames_per_image,
+            frames_hold,
+            frames_fade,
+            audio_fade_sec,
+            silent=True,
+            stop_event=stop_event,
+            pause_event=pause_event,
+        )
         done += 1
 
     log(f"\nBatch silent complete. {done} processed, {skipped} skipped of {total}.")
 
 # ─── MODE C: BATCH WITH AUDIO ─────────────────────────────────────────────────
 def mode_batch_audio(subfolders, frames_per_image, frames_hold,
-                     frames_fade, audio_fade_sec):
+                     frames_fade, audio_fade_sec, *, interactive=None, skip_done_default=True, stop_event=None, pause_event=None):
     """Process all folders with one shared audio track."""
     print("\n  Select audio track to apply to all folders:")
     audio_path = browse_audio()
@@ -924,121 +1084,196 @@ def mode_batch_audio(subfolders, frames_per_image, frames_hold,
         print("  No audio selected — returning to menu.")
         return
 
-    print("\n  Skip folders already marked [DONE]?")
-    skip_done = input("  Y/N [Y]: ").strip().upper()
-    skip_done = (skip_done != "N")
+    if interactive is None:
+        interactive = _is_interactive()
+    if interactive:
+        print("\n  Skip folders already marked [DONE]?")
+        skip_done = _safe_input("  Y/N [Y]: ", default="").strip().upper()
+        skip_done = (skip_done != "N")
+    else:
+        skip_done = bool(skip_done_default)
 
     total   = len(subfolders)
     done    = 0
     skipped = 0
 
     for folder in subfolders:
+        if stop_event is not None and stop_event.is_set():
+            log("  Stopped.")
+            break
+
+        while pause_event is not None and pause_event.is_set():
+            if stop_event is not None and stop_event.is_set():
+                log("  Stopped.")
+                break
+            time.sleep(0.1)
+
         folder_name = os.path.basename(folder)
         if skip_done and output_exists(folder_name):
             log(f"  Skipping [DONE]: {folder_name}")
             skipped += 1
             continue
+
         img_count = count_images(folder)
         if img_count == 0:
             log(f"  No images: {folder_name}")
             skipped += 1
             continue
-        process_folder(folder, frames_per_image, frames_hold,
-                       frames_fade, audio_fade_sec,
-                       auto_audio_path=audio_path)
+
+        process_folder(
+            folder,
+            frames_per_image,
+            frames_hold,
+            frames_fade,
+            audio_fade_sec,
+            auto_audio_path=audio_path,
+            silent=False,
+            stop_event=stop_event,
+            pause_event=pause_event,
+        )
         done += 1
 
     log(f"\nBatch audio complete. {done} processed, {skipped} skipped of {total}.")
 
-# ─── MODE D: ADD AUDIO TO EXISTING MOVIES ────────────────────────────────────
+
 def mode_add_audio_existing(audio_fade_sec):
+    
+    # ... (rest of the code remains the same)
     """
     Scan COTMovies for MP4s (excluding _music versions).
     Let user pick audio track, apply to all or selected.
     """
-    # Find candidate MP4s (no _music suffix)
-    try:
-        mp4s = sorted([
-            f for f in os.listdir(OUTPUT_DIR)
-            if f.lower().endswith(".mp4")
-            and not f.lower().endswith("_music.mp4")
-            and os.path.isfile(os.path.join(OUTPUT_DIR, f))
-        ])
-    except Exception as e:
-        log(f"ERROR reading output folder: {e}")
-        return
+    last_audio_path = None
 
-    if not mp4s:
-        print("  No MP4 files found in output folder.")
-        return
-
-    print(f"\n  Found {len(mp4s)} movie(s) in {OUTPUT_DIR}:")
-    for i, f in enumerate(mp4s, 1):
-        music_exists = os.path.isfile(
-            os.path.join(OUTPUT_DIR, os.path.splitext(f)[0] + "_music.mp4")
-        )
-        tag = "  [HAS AUDIO]" if music_exists else ""
-        print(f"  {i:3}. {f}{tag}")
-
-    print("\n  A. Apply audio to ALL   S. Select specific   Q. Cancel")
-    c = input("  Choice: ").strip().upper()
-    if c == "Q":
-        return
-
-    if c == "A":
-        targets = [os.path.join(OUTPUT_DIR, f) for f in mp4s]
-    elif c == "S":
-        sel = input("  Enter numbers separated by commas (e.g. 1,3,5): ").strip()
+    while True:
         try:
-            indices = [int(x.strip()) - 1 for x in sel.split(",")]
-            targets = [os.path.join(OUTPUT_DIR, mp4s[i])
-                       for i in indices if 0 <= i < len(mp4s)]
-            if not targets:
-                print("  No valid selections.")
-                return
-        except Exception:
-            print("  Invalid input.")
+            mp4s = sorted([
+                f for f in os.listdir(OUTPUT_DIR)
+                if f.lower().endswith(".mp4")
+                and not f.lower().endswith("_music.mp4")
+                and os.path.isfile(os.path.join(OUTPUT_DIR, f))
+            ])
+        except Exception as e:
+            log(f"ERROR reading output folder: {e}")
             return
-    else:
-        print("  Invalid choice.")
-        return
 
-    # Select audio
-    print("\n  Select audio track:")
-    audio_path = browse_audio()
-    if audio_path is None:
-        print("  No audio selected.")
-        return
+        if not mp4s:
+            print("  No MP4 files found in output folder.")
+            return
 
-    # Apply to each target
-    for video_path in targets:
-        # Get video duration via ffprobe
-        try:
-            result = subprocess.run(
-                [FFMPEG.replace("ffmpeg", "ffprobe"),
-                 "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", video_path],
-                capture_output=True, text=True
+        print(f"\n  Found {len(mp4s)} movie(s) in {OUTPUT_DIR}:")
+        for i, f in enumerate(mp4s, 1):
+            music_exists = os.path.isfile(
+                os.path.join(OUTPUT_DIR, os.path.splitext(f)[0] + "_music.mp4")
             )
-            total_duration = float(result.stdout.strip())
-        except Exception:
-            log(f"  Could not get duration for {os.path.basename(video_path)}, skipping.")
+            tag = "  [HAS AUDIO]" if music_exists else ""
+            print(f"  {i:3}. {f}{tag}")
+
+        print("\n  A. Apply audio to ALL   S. Select specific   Q. Cancel")
+        c_raw = input("  Choice: ").strip()
+        c = c_raw.upper()
+        if c == "Q":
+            break
+
+        if c == "A":
+            targets = [os.path.join(OUTPUT_DIR, f) for f in mp4s]
+        elif c == "S" or c_raw[:1].isdigit():
+            if c == "S":
+                sel = input("  Enter numbers separated by commas (e.g. 1,3,5): ").strip()
+            else:
+                sel = c_raw
+            try:
+                indices = [int(x.strip()) - 1 for x in sel.split(",")]
+                targets = [os.path.join(OUTPUT_DIR, mp4s[i])
+                           for i in indices if 0 <= i < len(mp4s)]
+                if not targets:
+                    print("  No valid selections.")
+                    continue
+            except Exception:
+                print("  Invalid input.")
+                continue
+        else:
+            print("  Invalid choice.")
             continue
 
-        # Estimate final image start (we don't know exactly, use 4s from end as proxy)
-        final_image_start = max(0.0, total_duration - 4.0)
+        for video_path in targets:
+            audio_path = None
+            if last_audio_path and os.path.isfile(last_audio_path):
+                print(f"\n  Movie: {os.path.basename(video_path)}")
+                print(f"  Last audio: {os.path.basename(last_audio_path)}")
+                print("  B. Browse new audio   R. Reuse last audio   S. Skip movie   Q. Quit")
+                c3 = input("  Choice [B]: ").strip().upper()
+                if c3 == "":
+                    c3 = "B"
+                if c3 == "Q":
+                    targets = []
+                    break
+                if c3 == "S":
+                    log(f"  Skipped: {os.path.basename(video_path)}")
+                    continue
+                if c3 == "R":
+                    audio_path = last_audio_path
+                elif c3 == "B":
+                    print("\n  Select audio track:")
+                    audio_path = browse_audio()
+                else:
+                    print("  Invalid choice, skipping movie.")
+                    continue
+            else:
+                print(f"\n  Movie: {os.path.basename(video_path)}")
+                print("  Select audio track (or Cancel to skip this movie):")
+                audio_path = browse_audio()
 
-        music_output = os.path.splitext(video_path)[0] + "_music.mp4"
-        if os.path.exists(music_output):
-            print(f"\n  {os.path.basename(music_output)} already exists.")
-            print("  O. Overwrite   S. Skip")
-            c2 = input("  Choice: ").strip().upper()
-            if c2 != "O":
-                log(f"  Skipped: {os.path.basename(music_output)}")
+            if audio_path is None:
+                log(f"  Skipped: {os.path.basename(video_path)}")
+                continue
+            last_audio_path = audio_path
+
+            ffprobe = os.path.join(os.path.dirname(FFMPEG), "ffprobe.exe")
+            if not os.path.isfile(ffprobe):
+                ffprobe = "ffprobe"
+            total_duration = None
+            duration_err = None
+            for cmd in (
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            ):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, **_NO_WINDOW_FLAGS)
+                    stdout = (result.stdout or "").strip()
+                    stderr = (result.stderr or "").strip()
+
+                    if result.returncode != 0:
+                        duration_err = f"ffprobe rc={result.returncode} stderr={stderr[-400:]}"
+                        continue
+
+                    token = stdout.split()[0] if stdout else ""
+                    total_duration = float(token)
+                    break
+                except Exception as e:
+                    duration_err = str(e)
+                    continue
+
+            if total_duration is None:
+                log(
+                    f"  Could not get duration for {os.path.basename(video_path)}, skipping."
+                    + (f" Details: {duration_err}" if duration_err else "")
+                )
                 continue
 
-        add_audio(video_path, audio_path, total_duration,
-                  final_image_start, audio_fade_sec, music_output)
+            final_image_start = max(0.0, total_duration - 4.0)
+
+            music_output = os.path.splitext(video_path)[0] + "_music.mp4"
+            if os.path.exists(music_output):
+                print(f"\n  {os.path.basename(music_output)} already exists.")
+                print("  O. Overwrite   S. Skip")
+                c2 = input("  Choice: ").strip().upper()
+                if c2 != "O":
+                    log(f"  Skipped: {os.path.basename(music_output)}")
+                    continue
+
+            add_audio(video_path, audio_path, total_duration,
+                      final_image_start, audio_fade_sec, music_output)
 
     log("Add audio to existing complete.")
 
