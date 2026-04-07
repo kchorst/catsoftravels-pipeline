@@ -4,6 +4,23 @@ A unified GUI launcher for a complete YouTube movie creation workflow, with an i
 
 Covers every stage from raw photos to published YouTube video: slideshow rendering, metadata generation, uploading, analytics, and audio preparation.
 
+## Docs (start here)
+
+- **User Guide (full workflow):** `USER_GUIDE.md`
+- **LLM Voice Guide (GUI-only):** `LLM_VOICE_GUI_GUIDE.md`
+
+## Audio Prep Suite (separate optional repo)
+
+The Audio Prep Suite tools are **optional** and **not included in this repo**.
+
+- Repo: https://github.com/kchorst/audio-prep-suite
+- Audio user guide (in that repo): `AUDIO_USER_GUIDE.md`
+
+To enable audio tools in the launcher:
+
+- Install/clone Audio Prep Suite
+- Settings → set the **Audio Prep Suite** folder path
+
 ---
 
 ## What's in This Repo
