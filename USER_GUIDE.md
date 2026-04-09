@@ -456,6 +456,9 @@ Note: Analytics metrics can take time to populate after publishing.
   - Description
   - Tags
   - Privacy
+- Allows bulk description updates:
+  - Prepend a standard heading (intro line / links)
+  - Append a standard footer (website / socials)
 
 This is the “library management” tool once videos are live.
 

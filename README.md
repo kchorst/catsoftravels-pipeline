@@ -298,7 +298,7 @@ python make_show.py
 
 ### Metadata Generator (CLI)
 
-Generates titles/descriptions/tags and can also run **UC6 View & Edit Live**.
+Generates titles/descriptions/tags and can also run **UC6 View & Edit Live** (including bulk description heading/footer updates for existing videos).
 
 ```bash
 python youtube_meta.py

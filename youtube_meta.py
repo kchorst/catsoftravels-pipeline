@@ -1694,7 +1694,7 @@ def mode_review_live():
 
         dry_run_label = "  *** DRY RUN ON ***" if dry_run else ""
         print(f"\n  Enter number to edit  |  /search  |  N=next  P=prev  Q=quit")
-        print(f"  B=bulk privacy  |  M=model select  |  V=toggle dry run{dry_run_label}  |  DEL=delete")
+        print(f"  B=bulk privacy  |  H=bulk description heading  |  F=bulk description footer  |  M=model select  |  V=toggle dry run{dry_run_label}  |  DEL=delete")
         if search_term:
             print(f"  C=clear filter")
         print()
@@ -1725,6 +1725,24 @@ def mode_review_live():
                     all_videos = _fetch_all_channel_videos(youtube, channel_id)
             except HttpError:
                 pass
+
+        elif cmd.upper() == "H":
+            _bulk_prepend_description_heading(
+                youtube,
+                yt_upload,
+                (filtered if search_term else all_videos),
+                dry_run=dry_run,
+                live_mod=_live,
+            )
+
+        elif cmd.upper() == "F":
+            _bulk_append_description_footer(
+                youtube,
+                yt_upload,
+                (filtered if search_term else all_videos),
+                dry_run=dry_run,
+                live_mod=_live,
+            )
 
         elif cmd.upper() == "DEL":
             if dry_run:
@@ -1931,6 +1949,286 @@ def _bulk_privacy_change(youtube, yt_upload, videos, dry_run=False, live_mod=Non
         import time as _bt; _bt.sleep(0.5)
 
     print(f"\n  Bulk change complete: {done} updated, {errors} errors.\n")
+
+
+def _prompt_multiline_block(title: str) -> str:
+    print(f"\n  {title}")
+    print("  Paste/type your text. Blank line to finish. Just Enter to cancel.\n")
+    lines = []
+    while True:
+        try:
+            line = input("  > ")
+        except EOFError:
+            break
+        if line.strip() == "":
+            break
+        lines.append(line.rstrip("\n"))
+    block = "\n".join(lines).strip()
+    return block
+
+
+def _bulk_append_description_footer(youtube, yt_upload, videos, *, dry_run=False, live_mod=None):
+    if not videos:
+        print("\n  No videos in scope.")
+        return
+
+    footer = _prompt_multiline_block("DESCRIPTION FOOTER — append to selected videos")
+    if not footer:
+        print("  Cancelled.")
+        return
+
+    eligible = [v for v in videos if not v.get("is_unlisted") and not v.get("is_draft")]
+    skipped = [v for v in videos if v.get("is_unlisted") or v.get("is_draft")]
+
+    if skipped:
+        print(f"\n  Skipping {len(skipped)} unlisted/draft videos (use YouTube Studio):")
+        for v in skipped[:5]:
+            print(f"    {v['title'][:50]}  →  {v['studio_url']}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped)-5} more")
+
+    if not eligible:
+        print("\n  No eligible videos to change.")
+        return
+
+    print(f"\n  About to append this footer to {len(eligible)} videos.")
+    if dry_run:
+        print("  DRY RUN — no changes will be pushed.")
+    confirm = input("  Confirm? (y/N): ").strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+
+    import time as _time
+
+    updated = 0
+    no_change = 0
+    too_long = 0
+    errors = 0
+
+    for i, v in enumerate(eligible, 1):
+        youtube_id = v.get("youtube_id")
+        title = (v.get("title") or "")[:45]
+        print(f"  [{i}/{len(eligible)}] {title}...", end=" ")
+
+        try:
+            if live_mod is not None:
+                current = live_mod.get_live_video_metadata(youtube, youtube_id)
+            else:
+                current = yt_upload.get_live_video_metadata(youtube, youtube_id)
+        except Exception as e:
+            print(f"ERROR fetching metadata: {e}")
+            errors += 1
+            continue
+
+        if not current:
+            print("ERROR fetching metadata")
+            errors += 1
+            continue
+
+        desc = current.get("description", "") or ""
+        if footer in desc:
+            print("skipped (already contains footer)")
+            no_change += 1
+            continue
+
+        sep = "\n\n" if desc.strip() else ""
+        new_desc = f"{desc.rstrip()}" + sep + footer
+
+        if len(new_desc) > 5000:
+            print("skipped (would exceed 5000 char limit)")
+            too_long += 1
+            continue
+
+        if dry_run:
+            print("(dry run)")
+            updated += 1
+            continue
+
+        try:
+            if live_mod is not None:
+                ok = live_mod.push_metadata_update(
+                    youtube,
+                    youtube_id,
+                    current.get("title", ""),
+                    new_desc,
+                    current.get("tags", ""),
+                    privacy=current.get("privacy", None),
+                    category=current.get("category", "19"),
+                    made_for_kids=current.get("made_for_kids", False),
+                    license=current.get("license", "youtube"),
+                    embeddable=current.get("embeddable", True),
+                    public_stats=current.get("public_stats", True),
+                    default_language=current.get("default_language", "en"),
+                    audio_language=current.get("audio_language", "en"),
+                    paid_promo=current.get("paid_promo", False),
+                )
+            else:
+                ok = yt_upload.push_metadata_update(
+                    youtube,
+                    youtube_id,
+                    current.get("title", ""),
+                    new_desc,
+                    current.get("tags", ""),
+                    privacy=current.get("privacy", None),
+                    category=current.get("category", "19"),
+                    made_for_kids=current.get("made_for_kids", False),
+                    license=current.get("license", "youtube"),
+                    embeddable=current.get("embeddable", True),
+                    public_stats=current.get("public_stats", True),
+                    default_language=current.get("default_language", "en"),
+                    audio_language=current.get("audio_language", "en"),
+                    paid_promo=current.get("paid_promo", False),
+                )
+
+            if ok:
+                print("done")
+                updated += 1
+            else:
+                print("FAILED")
+                errors += 1
+        except Exception as e:
+            print(f"ERROR pushing update: {e}")
+            errors += 1
+
+        _time.sleep(0.5)
+
+    print(
+        f"\n  Footer append complete: {updated} updated, {no_change} already had it, "
+        f"{too_long} too long, {errors} errors.\n"
+    )
+
+
+def _bulk_prepend_description_heading(youtube, yt_upload, videos, *, dry_run=False, live_mod=None):
+    if not videos:
+        print("\n  No videos in scope.")
+        return
+
+    heading = _prompt_multiline_block("DESCRIPTION HEADING — prepend to selected videos")
+    if not heading:
+        print("  Cancelled.")
+        return
+
+    eligible = [v for v in videos if not v.get("is_unlisted") and not v.get("is_draft")]
+    skipped = [v for v in videos if v.get("is_unlisted") or v.get("is_draft")]
+
+    if skipped:
+        print(f"\n  Skipping {len(skipped)} unlisted/draft videos (use YouTube Studio):")
+        for v in skipped[:5]:
+            print(f"    {v['title'][:50]}  →  {v['studio_url']}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped)-5} more")
+
+    if not eligible:
+        print("\n  No eligible videos to change.")
+        return
+
+    print(f"\n  About to prepend this heading to {len(eligible)} videos.")
+    if dry_run:
+        print("  DRY RUN — no changes will be pushed.")
+    confirm = input("  Confirm? (y/N): ").strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+
+    import time as _time
+
+    updated = 0
+    no_change = 0
+    too_long = 0
+    errors = 0
+
+    for i, v in enumerate(eligible, 1):
+        youtube_id = v.get("youtube_id")
+        title = (v.get("title") or "")[:45]
+        print(f"  [{i}/{len(eligible)}] {title}...", end=" ")
+
+        try:
+            if live_mod is not None:
+                current = live_mod.get_live_video_metadata(youtube, youtube_id)
+            else:
+                current = yt_upload.get_live_video_metadata(youtube, youtube_id)
+        except Exception as e:
+            print(f"ERROR fetching metadata: {e}")
+            errors += 1
+            continue
+
+        if not current:
+            print("ERROR fetching metadata")
+            errors += 1
+            continue
+
+        desc = current.get("description", "") or ""
+        if heading in desc:
+            print("skipped (already contains heading)")
+            no_change += 1
+            continue
+
+        sep = "\n\n" if desc.strip() else ""
+        new_desc = heading + sep + desc.lstrip()
+
+        if len(new_desc) > 5000:
+            print("skipped (would exceed 5000 char limit)")
+            too_long += 1
+            continue
+
+        if dry_run:
+            print("(dry run)")
+            updated += 1
+            continue
+
+        try:
+            if live_mod is not None:
+                ok = live_mod.push_metadata_update(
+                    youtube,
+                    youtube_id,
+                    current.get("title", ""),
+                    new_desc,
+                    current.get("tags", ""),
+                    privacy=current.get("privacy", None),
+                    category=current.get("category", "19"),
+                    made_for_kids=current.get("made_for_kids", False),
+                    license=current.get("license", "youtube"),
+                    embeddable=current.get("embeddable", True),
+                    public_stats=current.get("public_stats", True),
+                    default_language=current.get("default_language", "en"),
+                    audio_language=current.get("audio_language", "en"),
+                    paid_promo=current.get("paid_promo", False),
+                )
+            else:
+                ok = yt_upload.push_metadata_update(
+                    youtube,
+                    youtube_id,
+                    current.get("title", ""),
+                    new_desc,
+                    current.get("tags", ""),
+                    privacy=current.get("privacy", None),
+                    category=current.get("category", "19"),
+                    made_for_kids=current.get("made_for_kids", False),
+                    license=current.get("license", "youtube"),
+                    embeddable=current.get("embeddable", True),
+                    public_stats=current.get("public_stats", True),
+                    default_language=current.get("default_language", "en"),
+                    audio_language=current.get("audio_language", "en"),
+                    paid_promo=current.get("paid_promo", False),
+                )
+
+            if ok:
+                print("done")
+                updated += 1
+            else:
+                print("FAILED")
+                errors += 1
+        except Exception as e:
+            print(f"ERROR pushing update: {e}")
+            errors += 1
+
+        _time.sleep(0.5)
+
+    print(
+        f"\n  Heading prepend complete: {updated} updated, {no_change} already had it, "
+        f"{too_long} too long, {errors} errors.\n"
+    )
 
 
 def _get_channel_id(youtube):

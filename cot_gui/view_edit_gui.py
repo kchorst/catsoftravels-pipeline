@@ -45,7 +45,7 @@ class ViewEditGui(CotBaseWindow):
             self.options_frame,
             text="Fetches your live YouTube videos and lets you search, edit titles,\n"
                  "descriptions, tags, and privacy settings — then pushes changes to YouTube.\n"
-                 "Delete: type DEL in the session menu (disabled when Dry Run is ON).",
+                 "Bulk description: H=prepend heading, F=append footer. Delete: type DEL in the session menu (disabled when Dry Run is ON).",
             font=ctk.CTkFont(size=11), text_color="gray", anchor="w", justify="left"
         ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
